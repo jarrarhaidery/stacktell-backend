@@ -121,6 +121,14 @@ async def generate_onboarding(request: OnboardingRequest):
         logger.error(f"Onboarding gen failed: {e}")
         raise HTTPException(status_code=500, detail="Onboarding generation failed.")
 
+@app.get("/debug", tags=["System"])
+def debug():
+    import subprocess, shutil
+    return {
+        "git_in_path": shutil.which("git"),
+        "git_version": subprocess.run(["git", "--version"], capture_output=True, text=True).stdout,
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
