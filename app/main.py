@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Codebase Explainer API",
+    title="Stacktell API",
     description="RAG-powered API that indexes GitHub repos and answers questions about them.",
     version="1.0.0",
     lifespan=lifespan,
@@ -120,3 +120,7 @@ async def generate_onboarding(request: OnboardingRequest):
     except Exception as e:
         logger.error(f"Onboarding gen failed: {e}")
         raise HTTPException(status_code=500, detail="Onboarding generation failed.")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
