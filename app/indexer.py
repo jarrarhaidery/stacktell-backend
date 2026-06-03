@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from collections import defaultdict
 
-import git
+import httpx
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -44,84 +44,126 @@ def _index_path(repo_id: str) -> Path:
     return base / repo_id
 
 
-def _build_file_tree(root: Path, exclude_dirs: list[str]) -> list[FileNode]:
-    nodes = []
-    try:
-        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except PermissionError:
-        return nodes
-    for entry in entries:
-        if entry.name in exclude_dirs or entry.name.startswith("."):
-            continue
-        if entry.is_dir():
-            children = _build_file_tree(entry, exclude_dirs)
-            nodes.append(FileNode(name=entry.name, path=str(entry.relative_to(root.parent)), type="dir", children=children))
-        else:
-            lang = EXT_LANGUAGE_MAP.get(entry.suffix)
-            nodes.append(FileNode(name=entry.name, path=str(entry.relative_to(root.parent)), type="file", language=lang))
-    return nodes
+def _parse_owner_repo(url: str):
+    url = url.rstrip("/").replace(".git", "")
+    parts = url.split("/")
+    return parts[-2], parts[-1]
+
+
+async def _fetch_tree(owner: str, repo: str, branch: str, token: str = "") -> list:
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json().get("tree", [])
+
+
+async def _fetch_file(owner: str, repo: str, path: str, branch: str, token: str = "") -> str:
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            return ""
+        return r.text
+
+
+def _build_file_tree_from_paths(paths: list[str]) -> list[FileNode]:
+    tree = {}
+    for path in paths:
+        parts = path.split("/")
+        current = tree
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = None
+
+    def build(node, prefix=""):
+        result = []
+        for name, children in sorted(node.items(), key=lambda x: (x[1] is None, x[0])):
+            full_path = f"{prefix}/{name}" if prefix else name
+            if children is None:
+                ext = Path(name).suffix
+                result.append(FileNode(name=name, path=full_path, type="file", language=EXT_LANGUAGE_MAP.get(ext)))
+            else:
+                result.append(FileNode(name=name, path=full_path, type="dir", children=build(children, full_path)))
+        return result
+
+    return build(tree)
 
 
 async def index_repo(request: IndexRequest) -> IndexResponse:
     repo_id = _repo_id_from_url(request.repo_url)
     index_dir = _index_path(repo_id)
+    owner, repo_name = _parse_owner_repo(request.repo_url)
+    token = settings.github_token
 
-    with tempfile.TemporaryDirectory() as tmp:
-        url = request.repo_url
-        if settings.github_token:
-            url = url.replace("https://", f"https://{settings.github_token}@")
+    # Fetch file tree from GitHub API
+    tree = await _fetch_tree(owner, repo_name, request.branch, token)
 
-        git.Repo.clone_from(url, tmp, depth=1, branch=request.branch)
-        repo_name = Path(request.repo_url).stem
+    # Filter to indexable files only
+    indexable = [
+        item for item in tree
+        if item["type"] == "blob"
+        and Path(item["path"]).suffix in request.include_extensions
+        and not any(ex in item["path"].split("/") for ex in request.exclude_dirs)
+    ]
 
-        documents: list[Document] = []
-        language_counts: dict[str, int] = defaultdict(int)
-        total_files = 0
+    if not indexable:
+        raise ValueError("No indexable files found in the repository.")
 
-        for root, dirs, files in os.walk(tmp):
-            dirs[:] = [d for d in dirs if d not in request.exclude_dirs and not d.startswith(".")]
-            for fname in files:
-                fpath = Path(root) / fname
-                if fpath.suffix not in request.include_extensions:
-                    continue
-                try:
-                    content = fpath.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    continue
+    # Fetch file contents concurrently (batched to avoid rate limits)
+    documents: list[Document] = []
+    language_counts: dict[str, int] = defaultdict(int)
+    file_paths: list[str] = []
 
-                rel_path = str(fpath.relative_to(tmp))
-                lang = EXT_LANGUAGE_MAP.get(fpath.suffix, "Other")
-                language_counts[lang] += 1
-                total_files += 1
-                documents.append(Document(
-                    page_content=content,
-                    metadata={"source": rel_path, "language": lang, "repo_id": repo_id},
-                ))
+    async def fetch_and_add(item):
+        content = await _fetch_file(owner, repo_name, item["path"], request.branch, token)
+        if not content.strip():
+            return
+        ext = Path(item["path"]).suffix
+        lang = EXT_LANGUAGE_MAP.get(ext, "Other")
+        language_counts[lang] += 1
+        file_paths.append(item["path"])
+        documents.append(Document(
+            page_content=content,
+            metadata={"source": item["path"], "language": lang, "repo_id": repo_id},
+        ))
 
-        if not documents:
-            raise ValueError("No indexable files found in the repository.")
+    # Batch fetches — 10 at a time to avoid GitHub rate limits
+    batch_size = 10
+    for i in range(0, len(indexable), batch_size):
+        batch = indexable[i:i + batch_size]
+        await asyncio.gather(*[fetch_and_add(item) for item in batch])
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            separators=["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
-        )
-        chunks = splitter.split_documents(documents)
+    if not documents:
+        raise ValueError("Could not fetch any file contents.")
 
-        embeddings = _get_embeddings()
-        vectorstore = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: FAISS.from_documents(chunks, embeddings)
-        )
-        vectorstore.save_local(str(index_dir))
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+        separators=["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
+    )
+    chunks = splitter.split_documents(documents)
 
-        file_tree = _build_file_tree(Path(tmp), request.exclude_dirs)
+    embeddings = _get_embeddings()
+    vectorstore = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: FAISS.from_documents(chunks, embeddings)
+    )
+    vectorstore.save_local(str(index_dir))
 
-        return IndexResponse(
-            repo_id=repo_id,
-            repo_name=repo_name,
-            total_files=total_files,
-            total_chunks=len(chunks),
-            languages=dict(language_counts),
-            file_tree=file_tree,
-            message=f"Successfully indexed {total_files} files into {len(chunks)} chunks.",
-        )
+    file_tree = _build_file_tree_from_paths(file_paths)
+
+    return IndexResponse(
+        repo_id=repo_id,
+        repo_name=repo_name,
+        total_files=len(documents),
+        total_chunks=len(chunks),
+        languages=dict(language_counts),
+        file_tree=file_tree,
+        message=f"Successfully indexed {len(documents)} files into {len(chunks)} chunks.",
+    )
